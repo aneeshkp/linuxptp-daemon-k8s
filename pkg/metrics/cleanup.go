@@ -1,10 +1,11 @@
 package metrics
 
 import (
+	"strconv"
+
 	"github.com/k8snetworkplumbingwg/linuxptp-daemon/pkg/config"
 	"github.com/k8snetworkplumbingwg/linuxptp-daemon/pkg/synce"
 	"github.com/prometheus/client_golang/prometheus"
-	"strconv"
 )
 
 func DeleteSynceMetrics(process, configName string, relations *synce.Relations) {

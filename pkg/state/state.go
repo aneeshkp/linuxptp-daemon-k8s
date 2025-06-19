@@ -5,9 +5,10 @@ package state
 
 import (
 	"fmt"
+	"sync"
+
 	"github.com/k8snetworkplumbingwg/linuxptp-daemon/pkg/parser/constants"
 	"github.com/k8snetworkplumbingwg/linuxptp-daemon/pkg/utils"
-	"sync"
 )
 
 // PtpInterface represents a PTP interface with its name and alias

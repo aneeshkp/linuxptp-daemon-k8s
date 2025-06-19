@@ -1,9 +1,10 @@
 package metrics
 
 import (
+	"sync"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
-	"sync"
 )
 
 var registerMetrics sync.Once
@@ -140,5 +141,4 @@ func RegisterMetrics(nodeName string) {
 
 		NodeName = nodeName
 	})
-
 }
