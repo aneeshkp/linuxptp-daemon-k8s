@@ -34,6 +34,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	ptpv1 "github.com/k8snetworkplumbingwg/ptp-operator/api/v1"
+	"github.com/k8snetworkplumbingwg/linuxptp-daemon/pkg/parser"
+	parserconstants "github.com/k8snetworkplumbingwg/linuxptp-daemon/pkg/parser/constants"
 )
 
 const (
@@ -95,6 +97,8 @@ func NewProcessManager() *ProcessManager {
 		MaxOffsetThreshold: 100,
 		MinOffsetThreshold: -100,
 	}
+	// Set parser for the test process (will be updated when name is set)
+	processPTP.setParserForProcess()
 	return &ProcessManager{
 		process: []*ptpProcess{processPTP},
 	}
@@ -112,14 +116,17 @@ func NewDaemonForTests(tracker *ReadyTracker, processManager *ProcessManager) *D
 // SetTestProfileProcess ...
 func (p *ProcessManager) SetTestProfileProcess(name string, ifaces config.IFaces, socketPath,
 	processConfigPath string, nodeProfile ptpv1.PtpProfile) {
-	p.process = append(p.process, &ptpProcess{
+	testProcess := &ptpProcess{
 		name:              name,
 		ifaces:            ifaces,
 		processSocketPath: socketPath,
 		processConfigPath: processConfigPath,
 		execMutex:         sync.Mutex{},
 		nodeProfile:       nodeProfile,
-	})
+		parser:            nil, // Will be set by setParserForProcess
+	}
+	testProcess.setParserForProcess()
+	p.process = append(p.process, testProcess)
 }
 
 // SetTestData is used by unit tests
@@ -131,6 +138,8 @@ func (p *ProcessManager) SetTestData(name, msgTag string, ifaces config.IFaces) 
 	p.process[0].name = name
 	p.process[0].messageTag = msgTag
 	p.process[0].ifaces = ifaces
+	// Update parser for the new process name
+	p.process[0].setParserForProcess()
 }
 
 // RunProcessPTPMetrics is used by unit tests
@@ -186,6 +195,7 @@ type ptpProcess struct {
 	c                   *net.Conn
 	hasCollectedMetrics bool
 	trIfaceName         string // Time receiver interface name for T-BC clock monitoring
+	parser              parser.MetricsExtractor // Parser for extracting metrics and events from log output
 }
 
 func (p *ptpProcess) Stopped() bool {
@@ -665,7 +675,11 @@ func (dn *Daemon) applyNodePtpProfile(runID int, nodeProfile *ptpv1.PtpProfile) 
 			ptpClockThreshold: getPTPThreshold(nodeProfile),
 			haProfile:         haProfile,
 			syncERelations:    relations,
+			parser:            nil, // Will be set by setParserForProcess
 		}
+
+		// Set the appropriate parser for this process type
+		dprocess.setParserForProcess()
 
 		if pProcess == ptp4lProcessName {
 			if port, ok := (*nodeProfile).PtpSettings["upstreamPort"]; ok && clockType == event.BC {
@@ -1041,7 +1055,11 @@ func (p *ptpProcess) processPTPMetrics(output string) {
 		configName = strings.Split(configName, MessageTagSuffixSeperator)[0] // remove any suffix added to the configName
 		logEntry := synce.ParseLog(output)
 		p.ProcessSynceEvents(logEntry)
+	} else if p.parser != nil {
+		// Use parser-based approach for processes that have a parser
+		p.processWithParser(output)
 	} else {
+		// Fallback to old method for other processes
 		configName, source, ptpOffset, clockState, iface := extractMetrics(p.messageTag, p.name, p.ifaces, output)
 		p.hasCollectedMetrics = true
 		if iface != "" { // for ptp4l/phc2sys this function only update metrics
@@ -1065,6 +1083,110 @@ func (p *ptpProcess) processPTPMetrics(output string) {
 			}
 			p.ProcessTs2PhcEvents(ptpOffset, source, ifaceName, state, values)
 		}
+	}
+}
+
+// processWithParser uses the new parser-based approach for processes with parsers
+func (p *ptpProcess) processWithParser(output string) {
+	// Extract metrics and events using the parser
+	metrics, ptpEvent, err := p.parser.Extract(output)
+	if err != nil {
+		glog.Errorf("Failed to extract metrics from %s output: %v", p.name, err)
+		return
+	}
+	
+	p.hasCollectedMetrics = true
+	
+	// Process metrics if available
+	if metrics != nil {
+		p.processParsedMetrics(metrics)
+	}
+	
+	// Process PTP events if available
+	if ptpEvent != nil {
+		p.processParsedEvent(ptpEvent)
+	}
+}
+
+// processParsedMetrics handles metrics extracted by the parser
+func (p *ptpProcess) processParsedMetrics(metrics *parser.Metrics) {
+	// Update PTP metrics using the parsed data
+	updatePTPMetrics(metrics.Source, p.name, metrics.Iface, metrics.Offset, metrics.MaxOffset, metrics.FreqAdj, metrics.Delay)
+	
+	// Update clock state metrics if available
+	if metrics.ClockState != "" {
+		updateClockStateMetrics(p.name, metrics.Iface, string(metrics.ClockState))
+	}
+	
+	// Handle master offset source tracking
+	if metrics.Source == "master" {
+		configName := strings.Replace(strings.Replace(p.messageTag, "]", "", 1), "[", "", 1)
+		if configName != "" {
+			configName = strings.Split(configName, MessageTagSuffixSeperator)[0]
+			masterOffsetSource.set(configName, p.name)
+		}
+	}
+	
+	// Handle interface role tracking for ptp4l
+	if p.name == ptp4lProcessName && metrics.Iface != "" {
+		configName := strings.Replace(strings.Replace(p.messageTag, "]", "", 1), "[", "", 1)
+		if configName != "" {
+			configName = strings.Split(configName, MessageTagSuffixSeperator)[0]
+			masterOffsetIface.set(configName, metrics.Iface)
+		}
+	}
+}
+
+// processParsedEvent handles PTP events extracted by the parser
+func (p *ptpProcess) processParsedEvent(ptpEvent *parser.PTPEvent) {
+	if p.name == ptp4lProcessName && ptpEvent.PortID > 0 {
+		// Update interface role metrics
+		if len(p.ifaces) >= ptpEvent.PortID-1 {
+			interfaceName := p.ifaces[ptpEvent.PortID-1].Name
+			role := convertParserRoleToMetricsRole(ptpEvent.Role)
+			UpdateInterfaceRoleMetrics(p.name, interfaceName, role)
+			
+			// Handle role-specific logic
+			if ptpEvent.Role == parserconstants.PortRoleSlave {
+				configName := strings.Replace(strings.Replace(p.messageTag, "]", "", 1), "[", "", 1)
+				if configName != "" {
+					configName = strings.Split(configName, MessageTagSuffixSeperator)[0]
+					masterOffsetIface.set(configName, interfaceName)
+					slaveIface.set(configName, interfaceName)
+				}
+			} else if ptpEvent.Role == parserconstants.PortRoleFaulty {
+				configName := strings.Replace(strings.Replace(p.messageTag, "]", "", 1), "[", "", 1)
+				if configName != "" {
+					configName = strings.Split(configName, MessageTagSuffixSeperator)[0]
+					if slaveIface.isFaulty(configName, interfaceName) &&
+						masterOffsetSource.get(configName) == ptp4lProcessName {
+						updatePTPMetrics(master, p.name, masterOffsetIface.get(configName).alias, faultyOffset, faultyOffset, 0, 0)
+						updatePTPMetrics(phc, phc2sysProcessName, clockRealTime, faultyOffset, faultyOffset, 0, 0)
+						updateClockStateMetrics(p.name, masterOffsetIface.get(configName).alias, FREERUN)
+						masterOffsetIface.set(configName, "")
+						slaveIface.set(configName, "")
+					}
+				}
+			}
+		}
+	}
+}
+
+// convertParserRoleToMetricsRole converts parser role constants to metrics role constants
+func convertParserRoleToMetricsRole(role parserconstants.PTPPortRole) ptpPortRole {
+	switch role {
+	case parserconstants.PortRoleSlave:
+		return SLAVE
+	case parserconstants.PortRoleMaster:
+		return MASTER
+	case parserconstants.PortRolePassive:
+		return PASSIVE
+	case parserconstants.PortRoleFaulty:
+		return FAULTY
+	case parserconstants.PortRoleListening:
+		return LISTENING
+	default:
+		return UNKNOWN
 	}
 }
 
@@ -1467,4 +1589,15 @@ func containsAny(output string, indicators ...string) bool {
 		}
 	}
 	return false
+}
+
+func (p *ptpProcess) setParserForProcess() {
+	switch p.name {
+	case ptp4lProcessName:
+		p.parser = parser.NewPTP4LExtractor()
+	case phc2sysProcessName:
+		p.parser = parser.NewPhc2SysExtractor()
+	default:
+		glog.Errorf("No parser available for process: %s", p.name)
+	}
 }
